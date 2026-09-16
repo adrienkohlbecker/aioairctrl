@@ -14,7 +14,7 @@ from aiocoap.numbers.codes import (
     POST,
 )
 
-from aioairctrl.coap.encryption import EncryptionContext
+from aioairctrl.coap.encryption import DigestMismatchException, EncryptionContext
 
 logger = logging.getLogger(__name__)
 
@@ -131,7 +131,12 @@ class Client:
             yield decrypt_status(response)
             if observation is not None:
                 async for response in observation:
-                    yield decrypt_status(response)
+                    try:
+                        status = decrypt_status(response)
+                    except (DigestMismatchException, ValueError) as err:
+                        logger.warning("dropping unreadable status notification: %r", err)
+                        continue
+                    yield status
         finally:
             # Cancel the observation when the caller stops iterating, so the
             # device stops sending notifications and aiocoap frees its resources.
