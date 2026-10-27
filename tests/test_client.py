@@ -466,3 +466,46 @@ def test_shutdown_twice_shuts_the_context_down_once():
     run(client.shutdown())
     run(client.shutdown())
     assert context.shutdowns == 1
+
+
+def test_a_partial_notification_before_the_command_does_not_skip_confirmation():
+    async def scenario():
+        device = FakeDevice({"pwr": 1, "mode": 17}, applies=[False, False])
+        client = make_client(device)
+        task = await observed(client, device)
+        assert device.notifications is not None
+        payload = json.dumps({"state": {"reported": {"pwr": 1, "pm25": 4}}})
+        device.notifications.put_nowait(FakeMessage(device._enc.encrypt(payload).encode()))
+        await asyncio.sleep(0.01)
+        try:
+            return await client.set_control_values({"pwr": 1, "mode": 0}, confirm=True)
+        finally:
+            task.cancel()
+
+    assert run(scenario()) is False
+
+
+def test_a_notification_during_the_resync_stops_resending():
+    """The command's reply is lost; the device reports the change while the client resyncs."""
+
+    async def scenario():
+        device = FakeDevice({"pwr": 1, "mode": 17}, replies=[None], applies=[False], lost_syncs=1)
+        client = make_client(device)
+        task = await observed(client, device)
+
+        async def report_during_resync():
+            while device.syncs == 0:
+                await asyncio.sleep(0)
+            device.status["mode"] = 0
+            device.notify()
+
+        side = asyncio.create_task(report_during_resync())
+        try:
+            return await client.set_control_values({"mode": 0}, confirm=True), device
+        finally:
+            await side
+            task.cancel()
+
+    result, device = run(scenario())
+    assert result is True
+    assert device.controls == [{"mode": 0}]

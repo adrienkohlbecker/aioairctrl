@@ -43,9 +43,9 @@ class Client:
         # call even if _init never completed.
         self._client_context: Context | None = None
         self._encryption_context: EncryptionContext | None = None
-        # A copy of the latest status an active observe_status() received (the
-        # caller may edit the one it is given), and the confirmed commands
-        # waiting for a notification that reports them.
+        # Every key an active observe_status() received, with its latest value,
+        # kept apart from the yielded statuses (the caller may edit those), and
+        # the confirmed commands waiting for a notification that reports them.
         self._observed_status: dict | None = None
         self._confirmations: dict[asyncio.Future, dict] = {}
         # One command at a time: a resent command must not undo a newer one.
@@ -200,10 +200,14 @@ class Client:
                 observation.cancel()
 
     def _observed(self, status: dict) -> dict:
-        """Record a notified status and resolve the confirmations it reports."""
-        self._observed_status = dict(status)
+        """Record a notified status and resolve the confirmations it reports.
+
+        Statuses are merged, so a notification that omits a key the device
+        reported before neither drops it from a confirmation nor confirms it.
+        """
+        self._observed_status = observed = {**(self._observed_status or {}), **status}
         for confirmed, expected in self._confirmations.items():
-            if not confirmed.done() and _reports(status, expected):
+            if not confirmed.done() and _reports(observed, expected):
                 confirmed.set_result(True)
         return status
 
@@ -286,7 +290,7 @@ class Client:
         A failed or missing reply is retried. On the first failure, if
         resync=True, the client re-syncs the encryption key before retrying.
         Subsequent failures retry without re-syncing (stale key is unlikely to
-        be the cause after one resync). Retrying stops, returning False, once
+        be the cause after one resync). Sending stops, returning False, once
         the settled future is done.
         """
         state_desired = {
@@ -302,6 +306,8 @@ class Client:
         payload = json.dumps(state_desired)
         logger.debug("REQUEST: %s", payload)
         for attempt in range(retry_count + 1):
+            if settled is not None and settled.done():
+                return False
             payload_encrypted = self._enc.encrypt(payload)
             request = Message(
                 code=POST,
