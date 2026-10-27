@@ -15,17 +15,28 @@ class FakeDevice:
     """Answer sync and control requests and push status notifications.
 
     `replies` scripts each control reply ("success", "failed", None for a
-    lost reply, or "unreachable" for a network error); `applies` scripts
-    whether each accepted command changes the device; `lost_syncs` counts
-    sync requests to drop; `reply_delay` holds control replies back, so the
+    lost reply, "applied_lost" for a lost reply to an accepted command, or
+    "unreachable" for a network error); `applies` scripts whether each
+    accepted command changes the device; `lost_syncs` and `lost_statuses`
+    count sync and status requests to drop; `reply_delay` holds control replies back, so the
     notification arrives first; `silent` drops status requests.
     """
 
-    def __init__(self, status, replies=(), applies=(), lost_syncs=0, reply_delay=0.0, silent=False):
+    def __init__(
+        self,
+        status,
+        replies=(),
+        applies=(),
+        lost_syncs=0,
+        lost_statuses=0,
+        reply_delay=0.0,
+        silent=False,
+    ):
         self.status = dict(status)
         self.replies = list(replies)
         self.applies = list(applies)
         self.lost_syncs = lost_syncs
+        self.lost_statuses = lost_statuses
         self.reply_delay = reply_delay
         self.silent = silent
         self.controls = []
@@ -51,6 +62,8 @@ class FakeDevice:
                 requester.response.set_result(FakeMessage(b"0000ABCD"))
         elif path == ("sys", "dev", "status") and self.silent:
             pass
+        elif path == ("sys", "dev", "status") and self.lost_statuses:
+            self.lost_statuses -= 1
         elif path == ("sys", "dev", "status"):
             self.notifications = asyncio.Queue()
             requester.observation = FakeObservation(self.notifications)
@@ -67,10 +80,12 @@ class FakeDevice:
             reply = self.replies.pop(0) if self.replies else "success"
             if reply == "unreachable":
                 requester.response.set_exception(NetworkError("host unreachable"))
-            elif reply is not None:
+            elif reply not in (None, "applied_lost"):
                 message = FakeMessage(json.dumps({"status": reply}).encode())
                 loop.call_later(self.reply_delay, requester.response.set_result, message)
-            if reply == "success" and (self.applies.pop(0) if self.applies else True):
+            if reply in ("success", "applied_lost") and (
+                self.applies.pop(0) if self.applies else True
+            ):
                 changed = any(self.status.get(k) != v for k, v in data.items())
                 self.status.update(data)
                 if changed and self.notifications is not None:
@@ -351,14 +366,17 @@ def test_observation_ending_mid_confirmation_fails():
             await asyncio.sleep(0.01)
             task.cancel()
 
+        client.CONFIRM_TIMEOUT = 2
         stopper = asyncio.create_task(stop())
+        start = time.monotonic()
         result = await client.set_control_values({"mode": 0}, confirm=True)
         await stopper
-        return result, device
+        return result, device, time.monotonic() - start
 
-    result, device = run(scenario())
+    result, device, elapsed = run(scenario())
     assert result is False
     assert device.controls == [{"mode": 0}]
+    assert elapsed < 1  # failed when the observation ended, not at CONFIRM_TIMEOUT
 
 
 def test_control_retries_an_unreachable_network():
@@ -396,3 +414,55 @@ def test_observation_times_out_without_a_first_reply():
             pass
 
     raises_promptly(scenario())
+
+
+def test_a_notification_missing_a_command_key_does_not_confirm():
+    """A notification reporting the power but not the mode of a power-and-mode command."""
+
+    async def scenario():
+        device = FakeDevice({"pwr": 1, "mode": 17}, applies=[False, False])
+        client = make_client(device)
+        task = await observed(client, device)
+
+        async def partial():
+            await asyncio.sleep(0.01)
+            assert device.notifications is not None
+            payload = json.dumps({"state": {"reported": {"pwr": 1, "pm25": 4}}})
+            device.notifications.put_nowait(FakeMessage(device._enc.encrypt(payload).encode()))
+
+        side = asyncio.create_task(partial())
+        try:
+            return await client.set_control_values({"pwr": 1, "mode": 0}, confirm=True)
+        finally:
+            await side
+            task.cancel()
+
+    assert run(scenario()) is False
+
+
+def test_a_reported_command_stops_resending_lost_replies():
+    device = FakeDevice({"pwr": 1, "mode": 17}, replies=["applied_lost"] + [None] * 10)
+    assert run(_confirmed(device, {"mode": 0})) is True
+    assert device.controls == [{"mode": 0}]
+    assert device.syncs == 0
+
+
+def test_get_status_retries_a_lost_reply():
+    device = FakeDevice({"pwr": 0}, lost_statuses=2)
+    client = make_client(device)
+    assert run(client.get_status()) == ({"pwr": 0}, 60)
+
+
+def test_shutdown_twice_shuts_the_context_down_once():
+    class Context:
+        shutdowns = 0
+
+        async def shutdown(self):
+            self.shutdowns += 1
+
+    context = Context()
+    client = Client("192.0.2.1")
+    client._client_context = context  # type: ignore[assignment]
+    run(client.shutdown())
+    run(client.shutdown())
+    assert context.shutdowns == 1

@@ -82,8 +82,11 @@ class Client:
         return obj
 
     async def shutdown(self) -> None:
-        if self._client_context:
-            await self._client_context.shutdown()
+        # aiocoap's Context.shutdown() raises when called twice, so forget the
+        # context before shutting it down.
+        context, self._client_context = self._client_context, None
+        if context:
+            await context.shutdown()
 
     async def _request(self, request: Message) -> Message:
         """Send request and return its reply.
@@ -125,17 +128,27 @@ class Client:
         raise TimeoutError(f"{self.host} did not answer {self.SYNC_ATTEMPTS} sync requests")
 
     async def get_status(self):
-        """Return (state_reported, max_age) for the current device status."""
-        logger.debug("retrieving status")
-        request = Message(
-            code=GET,
-            mtype=NON,
-            uri=f"coap://{self.host}:{self.port}{self.STATUS_PATH}",
-        )
-        # observe=0 registers a CoAP observation; the first response carries
-        # the current state, which is all we consume here.
-        request.opt.observe = 0
-        response = await self._request(request)
+        """Return (state_reported, max_age) for the current device status.
+
+        A lost reply is retried like a sync, before raising TimeoutError.
+        """
+        for attempt in range(1, self.SYNC_ATTEMPTS + 1):
+            logger.debug("retrieving status (attempt %d/%d)", attempt, self.SYNC_ATTEMPTS)
+            request = Message(
+                code=GET,
+                mtype=NON,
+                uri=f"coap://{self.host}:{self.port}{self.STATUS_PATH}",
+            )
+            # observe=0 registers a CoAP observation; the first response carries
+            # the current state, which is all we consume here.
+            request.opt.observe = 0
+            try:
+                response = await self._request(request)
+            except TimeoutError:
+                continue
+            break
+        else:
+            raise TimeoutError(f"{self.host} did not answer {self.SYNC_ATTEMPTS} status requests")
         payload_encrypted = response.payload.decode()
         payload = self._enc.decrypt(payload_encrypted)
         logger.debug("status: %s", payload)
@@ -178,6 +191,9 @@ class Client:
                     yield self._observed(status)
         finally:
             self._observed_status = None
+            for confirmed in self._confirmations:
+                if not confirmed.done():
+                    confirmed.set_result(False)
             # Cancel the observation when the caller stops iterating, so the
             # device stops sending notifications and aiocoap frees its resources.
             if observation is not None:
@@ -186,9 +202,9 @@ class Client:
     def _observed(self, status: dict) -> dict:
         """Record a notified status and resolve the confirmations it reports."""
         self._observed_status = dict(status)
-        for confirmed, data in self._confirmations.items():
-            if not confirmed.done() and _reports(status, data):
-                confirmed.set_result(None)
+        for confirmed, expected in self._confirmations.items():
+            if not confirmed.done() and _reports(status, expected):
+                confirmed.set_result(True)
         return status
 
     async def set_control_value(
@@ -208,34 +224,46 @@ class Client:
         also needs a status notification reporting the new values, which only
         an observe_status() running on this client receives; the command is
         resent once if none arrives, and fails if that observation ends first.
-        Confirmation is skipped, and acceptance alone counts, when no
-        observation runs, when the device does not report the command's keys,
-        or when it already reports the values: the device sends nothing when
-        nothing changes. Values compare with ==, so they must be sent in the
-        type the device reports. Commands run one at a time, so a resend
-        never undoes a newer command.
+        A notification confirms the command only if it reports every key of
+        it that the device reported before. Confirmation is skipped, and
+        acceptance alone counts, when no observation runs, when the device
+        does not report the command's keys, or when it already reports the
+        values: the device sends nothing when nothing changes. Values compare
+        with ==, so they must be sent in the type the device reports. Commands
+        run one at a time, so a resend never undoes a newer command.
         """
         async with self._control_lock:
             status = self._observed_status
-            if not confirm or status is None or not any(k in status for k in data):
+            if not confirm or status is None:
                 return await self._send_control(data, retry_count, resync)
-            return await self._send_confirmed(data, retry_count, resync)
+            expected = {k: data[k] for k in data if k in status}
+            if not expected or _reports(status, expected):
+                return await self._send_control(data, retry_count, resync)
+            return await self._send_confirmed(data, expected, retry_count, resync)
 
-    async def _send_confirmed(self, data: dict, retry_count: int, resync: bool) -> bool:
+    async def _send_confirmed(
+        self, data: dict, expected: dict, retry_count: int, resync: bool
+    ) -> bool:
+        """Send data until a notification reports the expected values."""
         for attempt in range(1, self.CONFIRM_ATTEMPTS + 1):
-            status = self._observed_status
-            if status is None:
+            if self._observed_status is None:
                 logger.warning("%s stopped notifying before confirming %s", self.host, data)
                 return False
-            if _reports(status, data):
-                return await self._send_control(data, retry_count, resync)
             # Registered before sending, as the notification can beat the reply.
-            confirmed = asyncio.get_running_loop().create_future()
-            self._confirmations[confirmed] = data
+            # Resolves to True once reported, or False when the observation ends.
+            confirmed: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+            self._confirmations[confirmed] = expected
             try:
-                if not await self._send_control(data, retry_count, resync):
+                # A device whose replies get lost may still apply the command
+                # and report it, which settles the command.
+                if (
+                    not await self._send_control(data, retry_count, resync, confirmed)
+                    and not confirmed.done()
+                ):
                     return False
-                await asyncio.wait_for(confirmed, self.CONFIRM_TIMEOUT)
+                if not await asyncio.wait_for(confirmed, self.CONFIRM_TIMEOUT):
+                    logger.warning("%s stopped notifying before confirming %s", self.host, data)
+                    return False
                 return True
             except TimeoutError:
                 logger.warning(
@@ -250,13 +278,16 @@ class Client:
                 del self._confirmations[confirmed]
         return False
 
-    async def _send_control(self, data: dict, retry_count: int, resync: bool) -> bool:
+    async def _send_control(
+        self, data: dict, retry_count: int, resync: bool, settled: asyncio.Future | None = None
+    ) -> bool:
         """Send a control command until the device accepts it, retrying on failure.
 
         A failed or missing reply is retried. On the first failure, if
         resync=True, the client re-syncs the encryption key before retrying.
         Subsequent failures retry without re-syncing (stale key is unlikely to
-        be the cause after one resync).
+        be the cause after one resync). Retrying stops, returning False, once
+        the settled future is done.
         """
         state_desired = {
             "state": {
@@ -287,6 +318,8 @@ class Client:
                 result = json.loads(response.payload)
                 if result.get("status") == "success":
                     return True
+            if settled is not None and settled.done():
+                return False
             if attempt == 0 and resync:
                 logger.debug("set_control_value failed, resyncing...")
                 try:
@@ -303,7 +336,6 @@ class Client:
         return False
 
 
-def _reports(status: dict, data: dict) -> bool:
-    """Whether status carries some key of data, and data's value for each it carries."""
-    reported = [k for k in data if k in status]
-    return bool(reported) and all(status[k] == data[k] for k in reported)
+def _reports(status: dict, expected: dict) -> bool:
+    """Whether status carries every key of expected, with its value."""
+    return all(k in status and status[k] == v for k, v in expected.items())
