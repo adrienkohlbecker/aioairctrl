@@ -10,6 +10,7 @@ from aiocoap import (
     Context,
     Message,
 )
+from aiocoap.error import NetworkError
 from aiocoap.numbers.codes import (
     GET,
     POST,
@@ -25,8 +26,9 @@ class Client:
     CONTROL_PATH = "/sys/dev/control"
     SYNC_PATH = "/sys/dev/sync"
 
-    # Every request is NON (no CoAP retransmission), so a lost request or reply
-    # never arrives late: waiting longer than a round trip only delays the retry.
+    # Every request is NON, so CoAP never retransmits a lost request or reply:
+    # the client gives up after REPLY_TIMEOUT and retries itself. A reply that
+    # arrives later is ignored, though the device may have applied the command.
     REPLY_TIMEOUT: float = 5
     SYNC_ATTEMPTS = 3
     # How long a confirmed command waits for the status notification that
@@ -41,10 +43,13 @@ class Client:
         # call even if _init never completed.
         self._client_context: Context | None = None
         self._encryption_context: EncryptionContext | None = None
-        # The latest status an active observe_status() received, and the
-        # confirmed commands waiting for a notification that reports them.
+        # A copy of the latest status an active observe_status() received (the
+        # caller may edit the one it is given), and the confirmed commands
+        # waiting for a notification that reports them.
         self._observed_status: dict | None = None
         self._confirmations: dict[asyncio.Future, dict] = {}
+        # One command at a time: a resent command must not undo a newer one.
+        self._control_lock = asyncio.Lock()
 
     @property
     def _ctx(self) -> Context:
@@ -81,8 +86,16 @@ class Client:
             await self._client_context.shutdown()
 
     async def _request(self, request: Message) -> Message:
-        """Send request and return its reply, raising TimeoutError if none arrives."""
-        return await asyncio.wait_for(self._ctx.request(request).response, self.REPLY_TIMEOUT)
+        """Send request and return its reply.
+
+        Raises TimeoutError when no reply arrives in time, or when the network
+        reports the device unreachable (aiocoap's NetworkError), since both
+        mean the request may be retried.
+        """
+        try:
+            return await asyncio.wait_for(self._ctx.request(request).response, self.REPLY_TIMEOUT)
+        except NetworkError as ex:
+            raise TimeoutError(f"{self.host} unreachable: {ex}") from ex
 
     async def _sync(self):
         """Exchange a nonce with the device to obtain the initial client key.
@@ -153,7 +166,7 @@ class Client:
         requester = self._ctx.request(request)
         observation = requester.observation
         try:
-            response = await requester.response
+            response = await asyncio.wait_for(requester.response, self.REPLY_TIMEOUT)
             yield self._observed(decrypt_status(response))
             if observation is not None:
                 async for response in observation:
@@ -172,7 +185,7 @@ class Client:
 
     def _observed(self, status: dict) -> dict:
         """Record a notified status and resolve the confirmations it reports."""
-        self._observed_status = status
+        self._observed_status = dict(status)
         for confirmed, data in self._confirmations.items():
             if not confirmed.done() and _reports(status, data):
                 confirmed.set_result(None)
@@ -191,17 +204,29 @@ class Client:
         """Send a control command to the device, returning whether it took effect.
 
         Without confirm, success means the device accepted the command. Some
-        devices accept a command and then ignore it, so with confirm and an
-        active observe_status() on this client, success also needs a status
-        notification reporting the new values; the command is resent once if
-        none arrives. A command the device already reports, or one whose keys
-        the device never reports, is not waited on: the device sends no
-        notification when nothing changes.
+        devices accept a command and then ignore it, so with confirm, success
+        also needs a status notification reporting the new values, which only
+        an observe_status() running on this client receives; the command is
+        resent once if none arrives, and fails if that observation ends first.
+        Confirmation is skipped, and acceptance alone counts, when no
+        observation runs, when the device does not report the command's keys,
+        or when it already reports the values: the device sends nothing when
+        nothing changes. Values compare with ==, so they must be sent in the
+        type the device reports. Commands run one at a time, so a resend
+        never undoes a newer command.
         """
-        for attempt in range(1, self.CONFIRM_ATTEMPTS + 1):
+        async with self._control_lock:
             status = self._observed_status
             if not confirm or status is None or not any(k in status for k in data):
                 return await self._send_control(data, retry_count, resync)
+            return await self._send_confirmed(data, retry_count, resync)
+
+    async def _send_confirmed(self, data: dict, retry_count: int, resync: bool) -> bool:
+        for attempt in range(1, self.CONFIRM_ATTEMPTS + 1):
+            status = self._observed_status
+            if status is None:
+                logger.warning("%s stopped notifying before confirming %s", self.host, data)
+                return False
             if _reports(status, data):
                 return await self._send_control(data, retry_count, resync)
             # Registered before sending, as the notification can beat the reply.
@@ -279,5 +304,6 @@ class Client:
 
 
 def _reports(status: dict, data: dict) -> bool:
-    """Whether status reports every key of data that it carries, with data's value."""
-    return all(status[k] == v for k, v in data.items() if k in status)
+    """Whether status carries some key of data, and data's value for each it carries."""
+    reported = [k for k in data if k in status]
+    return bool(reported) and all(status[k] == data[k] for k in reported)

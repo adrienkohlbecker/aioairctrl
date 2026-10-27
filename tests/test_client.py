@@ -2,8 +2,10 @@
 
 import asyncio
 import json
+import time
 
 import pytest
+from aiocoap.error import NetworkError
 
 from aioairctrl.coap.client import Client
 from aioairctrl.coap.encryption import EncryptionContext
@@ -12,16 +14,20 @@ from aioairctrl.coap.encryption import EncryptionContext
 class FakeDevice:
     """Answer sync and control requests and push status notifications.
 
-    `replies` scripts each control reply ("success", "failed" or None for a
-    lost reply); `applies` scripts whether each accepted command changes the
-    device; `lost_syncs` counts sync requests to drop.
+    `replies` scripts each control reply ("success", "failed", None for a
+    lost reply, or "unreachable" for a network error); `applies` scripts
+    whether each accepted command changes the device; `lost_syncs` counts
+    sync requests to drop; `reply_delay` holds control replies back, so the
+    notification arrives first; `silent` drops status requests.
     """
 
-    def __init__(self, status, replies=(), applies=(), lost_syncs=0):
+    def __init__(self, status, replies=(), applies=(), lost_syncs=0, reply_delay=0.0, silent=False):
         self.status = dict(status)
         self.replies = list(replies)
         self.applies = list(applies)
         self.lost_syncs = lost_syncs
+        self.reply_delay = reply_delay
+        self.silent = silent
         self.controls = []
         self.syncs = 0
         self.notifications: asyncio.Queue | None = None
@@ -43,6 +49,8 @@ class FakeDevice:
                 self.lost_syncs -= 1
             else:
                 requester.response.set_result(FakeMessage(b"0000ABCD"))
+        elif path == ("sys", "dev", "status") and self.silent:
+            pass
         elif path == ("sys", "dev", "status"):
             self.notifications = asyncio.Queue()
             requester.observation = FakeObservation(self.notifications)
@@ -57,8 +65,11 @@ class FakeDevice:
             }
             self.controls.append(data)
             reply = self.replies.pop(0) if self.replies else "success"
-            if reply is not None:
-                requester.response.set_result(FakeMessage(json.dumps({"status": reply}).encode()))
+            if reply == "unreachable":
+                requester.response.set_exception(NetworkError("host unreachable"))
+            elif reply is not None:
+                message = FakeMessage(json.dumps({"status": reply}).encode())
+                loop.call_later(self.reply_delay, requester.response.set_result, message)
             if reply == "success" and (self.applies.pop(0) if self.applies else True):
                 changed = any(self.status.get(k) != v for k, v in data.items())
                 self.status.update(data)
@@ -240,3 +251,148 @@ def test_observation_end_stops_confirming():
         return await client.set_control_values({"mode": 0}, confirm=True)
 
     assert run(scenario()) is True
+
+
+def test_confirmed_control_resends_after_only_a_stale_notification():
+    async def scenario():
+        device = FakeDevice({"pwr": 1, "mode": 17}, applies=[False, True])
+        client = make_client(device)
+        task = await observed(client, device)
+        device.notify()  # the old mode again, not a confirmation
+        try:
+            return await client.set_control_values({"mode": 0}, confirm=True), device
+        finally:
+            task.cancel()
+
+    result, device = run(scenario())
+    assert result is True
+    assert device.controls == [{"mode": 0}, {"mode": 0}]
+
+
+def test_confirmed_control_catches_a_notification_before_the_reply():
+    device = FakeDevice({"pwr": 1, "mode": 17}, reply_delay=0.005)
+    assert run(_confirmed(device, {"mode": 0})) is True
+    assert device.controls == [{"mode": 0}]
+
+
+def test_resend_does_not_undo_a_newer_command():
+    async def scenario():
+        device = FakeDevice({"pwr": 1, "mode": 17}, applies=[False, True, True])
+        client = make_client(device)
+        task = await observed(client, device)
+        try:
+            first = asyncio.create_task(client.set_control_values({"mode": 0}, confirm=True))
+            await asyncio.sleep(0)
+            second = asyncio.create_task(client.set_control_values({"mode": 18}, confirm=True))
+            return await asyncio.gather(first, second), device
+        finally:
+            task.cancel()
+
+    results, device = run(scenario())
+    assert results == [True, True]
+    assert device.controls == [{"mode": 0}, {"mode": 0}, {"mode": 18}]
+    assert device.status["mode"] == 18
+
+
+def test_editing_the_yielded_status_does_not_fake_a_confirmation():
+    async def scenario():
+        device = FakeDevice({"pwr": 1, "mode": 17}, applies=[False, False])
+        client = make_client(device)
+        statuses = []
+        seen = asyncio.Event()
+
+        async def observe():
+            async for status in client.observe_status():
+                statuses.append(status)
+                seen.set()
+
+        task = asyncio.create_task(observe())
+        await asyncio.wait_for(seen.wait(), 1)
+        statuses[-1]["mode"] = 0  # an optimistic write by the caller
+        try:
+            return await client.set_control_values({"mode": 0}, confirm=True), device
+        finally:
+            task.cancel()
+
+    result, device = run(scenario())
+    assert result is False
+    assert device.controls == [{"mode": 0}, {"mode": 0}]
+
+
+def test_a_notification_without_the_keys_does_not_confirm():
+    async def scenario():
+        device = FakeDevice({"pwr": 1, "mode": 17}, applies=[False, False])
+        client = make_client(device)
+        task = await observed(client, device)
+
+        async def unrelated():
+            await asyncio.sleep(0.01)
+            assert device.notifications is not None
+            payload = json.dumps({"state": {"reported": {"pm25": 4}}})
+            device.notifications.put_nowait(FakeMessage(device._enc.encrypt(payload).encode()))
+
+        side = asyncio.create_task(unrelated())
+        try:
+            return await client.set_control_values({"mode": 0}, confirm=True)
+        finally:
+            await side
+            task.cancel()
+
+    assert run(scenario()) is False
+
+
+def test_observation_ending_mid_confirmation_fails():
+    async def scenario():
+        device = FakeDevice({"pwr": 1, "mode": 17}, applies=[False])
+        client = make_client(device)
+        task = await observed(client, device)
+
+        async def stop():
+            await asyncio.sleep(0.01)
+            task.cancel()
+
+        stopper = asyncio.create_task(stop())
+        result = await client.set_control_values({"mode": 0}, confirm=True)
+        await stopper
+        return result, device
+
+    result, device = run(scenario())
+    assert result is False
+    assert device.controls == [{"mode": 0}]
+
+
+def test_control_retries_an_unreachable_network():
+    device = FakeDevice({"pwr": 0}, replies=["unreachable", "success"])
+    client = make_client(device)
+    assert run(client.set_control_values({"pwr": 1})) is True
+    assert len(device.controls) == 2
+
+
+def test_lost_control_reply_resyncs_once():
+    device = FakeDevice({"pwr": 0}, replies=[None, None, "success"])
+    client = make_client(device)
+    assert run(client.set_control_values({"pwr": 1})) is True
+    assert device.syncs == 1
+
+
+def raises_promptly(coroutine):
+    """Assert coroutine raises the client's TimeoutError, well before run()'s own."""
+    start = time.monotonic()
+    with pytest.raises(TimeoutError):
+        run(coroutine)
+    assert time.monotonic() - start < 1
+
+
+def test_get_status_times_out():
+    device = FakeDevice({"pwr": 0}, silent=True)
+    client = make_client(device)
+    raises_promptly(client.get_status())
+
+
+def test_observation_times_out_without_a_first_reply():
+    async def scenario():
+        client = make_client(FakeDevice({"pwr": 0}, silent=True))
+        async for _status in client.observe_status():
+            pass
+
+    raises_promptly(scenario())
