@@ -19,7 +19,8 @@ class FakeDevice:
     "unreachable" for a network error); `applies` scripts whether each
     accepted command changes the device; `lost_syncs` and `lost_statuses`
     count sync and status requests to drop; `reply_delay` holds control replies back, so the
-    notification arrives first; `silent` drops status requests.
+    notification arrives first; `silent` drops status requests; `quiet`
+    answers a status request only with the next change, as the firmware does.
     """
 
     def __init__(
@@ -31,6 +32,7 @@ class FakeDevice:
         lost_statuses=0,
         reply_delay=0.0,
         silent=False,
+        quiet=False,
     ):
         self.status = dict(status)
         self.replies = list(replies)
@@ -39,6 +41,8 @@ class FakeDevice:
         self.lost_statuses = lost_statuses
         self.reply_delay = reply_delay
         self.silent = silent
+        self.quiet = quiet
+        self._registration: asyncio.Future | None = None
         self.controls = []
         self.syncs = 0
         self.notifications: asyncio.Queue | None = None
@@ -47,8 +51,12 @@ class FakeDevice:
 
     def notify(self):
         payload = json.dumps({"state": {"reported": self.status}})
+        message = FakeMessage(self._enc.encrypt(payload).encode())
+        if self._registration is not None and not self._registration.done():
+            self._registration.set_result(message)
+            return
         assert self.notifications is not None
-        self.notifications.put_nowait(FakeMessage(self._enc.encrypt(payload).encode()))
+        self.notifications.put_nowait(message)
 
     def request(self, message):
         loop = asyncio.get_running_loop()
@@ -67,8 +75,9 @@ class FakeDevice:
         elif path == ("sys", "dev", "status"):
             self.notifications = asyncio.Queue()
             requester.observation = FakeObservation(self.notifications)
-            self.notify()
-            requester.response.set_result(self.notifications.get_nowait())
+            self._registration = requester.response
+            if not self.quiet:
+                self.notify()
         elif path == ("sys", "dev", "control"):
             desired = json.loads(EncryptionContext().decrypt(message.payload.decode()))
             data = {
@@ -407,13 +416,165 @@ def test_get_status_times_out():
     raises_promptly(client.get_status())
 
 
-def test_observation_times_out_without_a_first_reply():
-    async def scenario():
-        client = make_client(FakeDevice({"pwr": 0}, silent=True))
-        async for _status in client.observe_status():
-            pass
+async def quiet_observation(client):
+    """Start observing a quiet device; return the task and the statuses it sees."""
+    statuses: list[dict] = []
 
-    raises_promptly(scenario())
+    async def observe():
+        async for status in client.observe_status():
+            statuses.append(status)
+
+    task = asyncio.create_task(observe())
+    while not client.observing:
+        await asyncio.sleep(0)
+    return task, statuses
+
+
+def test_observation_waits_for_the_first_change_of_a_quiet_device():
+    async def scenario():
+        device = FakeDevice({"pwr": 1, "mode": 17}, quiet=True)
+        client = make_client(device)
+        task, statuses = await quiet_observation(client)
+        await asyncio.sleep(client.REPLY_TIMEOUT * 5)
+        assert statuses == []
+        assert client.observing
+        device.status["pm25"] = 3
+        device.notify()
+        await asyncio.sleep(0.01)
+        task.cancel()
+        return statuses
+
+    assert run(scenario()) == [{"pwr": 1, "mode": 17, "pm25": 3}]
+
+
+async def _confirmed_before_first_notification(device, data):
+    client = make_client(device)
+    task, _ = await quiet_observation(client)
+    try:
+        return await client.set_control_values(data, confirm=True)
+    finally:
+        task.cancel()
+
+
+def test_a_command_before_the_first_notification_is_confirmed_by_its_change():
+    device = FakeDevice({"pwr": 1, "mode": 17}, quiet=True)
+    assert run(_confirmed_before_first_notification(device, {"mode": 0})) is True
+    assert device.controls == [{"mode": 0}]
+
+
+def test_an_ignored_command_before_the_first_notification_fails():
+    device = FakeDevice({"pwr": 1, "mode": 17}, applies=[False, False], quiet=True)
+    assert run(_confirmed_before_first_notification(device, {"mode": 0})) is False
+    assert device.controls == [{"mode": 0}, {"mode": 0}]
+
+
+def test_an_unreadable_first_notification_is_dropped():
+    async def scenario():
+        device = FakeDevice({"pwr": 1}, quiet=True)
+        client = make_client(device)
+        task, statuses = await quiet_observation(client)
+        assert device._registration is not None
+        device._registration.set_result(FakeMessage(b"not encrypted"))
+        await asyncio.sleep(0)
+        device.notify()
+        await asyncio.sleep(0.01)
+        task.cancel()
+        return statuses
+
+    assert run(scenario()) == [{"pwr": 1}]
+
+
+def test_a_renewed_observation_keeps_the_notified_status():
+    """Renewed as the coordinator does: the old observation ends first."""
+
+    async def scenario():
+        device = FakeDevice({"pwr": 1, "mode": 0}, quiet=True)
+        client = make_client(device)
+        old, _ = await quiet_observation(client)
+        device.notify()
+        await asyncio.sleep(0.01)
+        old.cancel()
+        await asyncio.sleep(0.01)
+        new, _ = await quiet_observation(client)
+        try:
+            # The device already reports mode 0, so it notifies nothing.
+            return await client.set_control_values({"mode": 0}, confirm=True)
+        finally:
+            new.cancel()
+
+    assert run(scenario()) is True
+
+
+def test_a_remembered_status_spares_waiting_on_values_the_device_has():
+    async def scenario():
+        device = FakeDevice({"pwr": 1, "mode": 0}, quiet=True)
+        client = make_client(device)
+        client.remember_status({"pwr": 1, "mode": 0})
+        task, _ = await quiet_observation(client)
+        try:
+            return await client.set_control_values({"mode": 0}, confirm=True)
+        finally:
+            task.cancel()
+
+    assert run(scenario()) is True
+
+
+def test_a_replacing_observation_keeps_observing_when_the_old_one_ends_late():
+    async def scenario():
+        device = FakeDevice({"pwr": 1}, quiet=True)
+        client = make_client(device)
+        old, _ = await quiet_observation(client)
+        client._observing = False  # let the next helper wait for the new registration
+        new, _ = await quiet_observation(client)
+        old.cancel()
+        await asyncio.sleep(0.01)
+        observing = client.observing
+        new.cancel()
+        await asyncio.sleep(0.01)
+        return observing, client.observing
+
+    assert run(scenario()) == (True, False)
+
+
+class PingResponder(asyncio.DatagramProtocol):
+    """A local endpoint answering empty CoAP pings, or packets, as scripted."""
+
+    def __init__(self, answer):
+        self.answer = answer
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        reply = self.answer(data)
+        if reply is not None:
+            self.transport.sendto(reply, addr)
+
+
+async def _ping(answer):
+    loop = asyncio.get_running_loop()
+    transport, _ = await loop.create_datagram_endpoint(
+        lambda: PingResponder(answer), local_addr=("127.0.0.1", 0)
+    )
+    try:
+        client = Client("127.0.0.1", port=transport.get_extra_info("sockname")[1])
+        client.PING_TIMEOUT = 0.1
+        return await client.ping()
+    finally:
+        transport.close()
+
+
+def test_ping_is_answered_by_a_reset():
+    # RST (0x70) echoing the ping's message ID.
+    assert run(_ping(lambda data: bytes([0x70, 0]) + data[2:4])) is True
+
+
+def test_unanswered_ping_fails():
+    assert run(_ping(lambda data: None)) is False
+
+
+def test_ping_ignores_a_reset_for_another_message():
+    assert run(_ping(lambda data: bytes([0x70, 0, data[2] ^ 0xFF, data[3]]))) is False
 
 
 def test_a_notification_missing_a_command_key_does_not_confirm():
@@ -509,3 +670,16 @@ def test_a_notification_during_the_resync_stops_resending():
     result, device = run(scenario())
     assert result is True
     assert device.controls == [{"mode": 0}]
+
+
+def test_ping_without_a_route_fails(monkeypatch):
+    async def scenario():
+        loop = asyncio.get_running_loop()
+
+        async def no_route(*args, **kwargs):
+            raise OSError("Network is unreachable")
+
+        monkeypatch.setattr(loop, "create_datagram_endpoint", no_route)
+        return await Client("192.0.2.1").ping()
+
+    assert run(scenario()) is False

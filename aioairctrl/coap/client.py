@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import struct
 
 from aiocoap import (
     NON,
@@ -35,6 +36,8 @@ class Client:
     # reports it, and how often it is sent before giving up.
     CONFIRM_TIMEOUT: float = 5
     CONFIRM_ATTEMPTS = 2
+    # How long ping() waits for the device's reset.
+    PING_TIMEOUT: float = 2
 
     def __init__(self, host, port=5683):
         self.host = host
@@ -43,11 +46,17 @@ class Client:
         # call even if _init never completed.
         self._client_context: Context | None = None
         self._encryption_context: EncryptionContext | None = None
-        # Every key an active observe_status() received, with its latest value,
-        # kept apart from the yielded statuses (the caller may edit those), and
-        # the confirmed commands waiting for a notification that reports them.
+        # Every key notified to this client, with its latest value, kept apart
+        # from the yielded statuses (the caller may edit those) and across
+        # observations, as the device notifies only changes; and the confirmed
+        # commands waiting for a notification that reports them.
         self._observed_status: dict | None = None
         self._confirmations: dict[asyncio.Future, dict] = {}
+        # Set while an observe_status() registration stands, even before its
+        # first notification. A replacing registration bumps the generation,
+        # so the replaced one's cleanup leaves the new state alone.
+        self._observing = False
+        self._observation_generation = 0
         # One command at a time: a resent command must not undo a newer one.
         self._control_lock = asyncio.Lock()
 
@@ -80,6 +89,65 @@ class Client:
         obj = cls(*args, **kwargs)
         await obj._init()
         return obj
+
+    def remember_status(self, status: dict) -> None:
+        """Seed the status confirmations compare against, for a new client.
+
+        Pass the status a previous client was notified, so that a command for
+        values the device already has is not waited on: the device notifies
+        nothing when nothing changes.
+        """
+        if self._observed_status is None:
+            self._observed_status = dict(status)
+
+    @property
+    def observing(self) -> bool:
+        """Whether an observe_status() registration stands, notified or not."""
+        return self._observing
+
+    async def ping(self) -> bool:
+        """Return whether the device answers an empty CoAP ping, within PING_TIMEOUT.
+
+        The device answers a confirmable empty message with a reset at once,
+        unlike a status request, which it answers only once the status
+        changes, so this is the liveness check. It uses its own socket: a ping
+        sent through aiocoap that goes unanswered would fail every pending
+        request to the device, observations included.
+        """
+        loop = asyncio.get_running_loop()
+        mid = int.from_bytes(os.urandom(2), "big")
+        answered = loop.create_future()
+
+        class Protocol(asyncio.DatagramProtocol):
+            def datagram_received(self, data, addr):
+                # RST (type 3) carrying our message ID.
+                if (
+                    len(data) >= 4
+                    and (data[0] >> 4) & 3 == 3
+                    and data[2:4] == mid.to_bytes(2, "big")
+                ):
+                    if not answered.done():
+                        answered.set_result(True)
+
+            def error_received(self, exc):
+                # ICMP unreachable on the connected socket: the device is gone.
+                if not answered.done():
+                    answered.set_result(False)
+
+        try:
+            transport, _ = await loop.create_datagram_endpoint(
+                Protocol, remote_addr=(self.host, self.port)
+            )
+        except OSError:
+            # No route to the device, for one.
+            return False
+        try:
+            transport.sendto(struct.pack("!BBH", 0x40, 0x00, mid))  # ver 1, CON, no token, empty
+            return await asyncio.wait_for(answered, self.PING_TIMEOUT)
+        except TimeoutError:
+            return False
+        finally:
+            transport.close()
 
     async def shutdown(self) -> None:
         # aiocoap's Context.shutdown() raises when called twice, so forget the
@@ -160,7 +228,14 @@ class Client:
         return state_reported["state"]["reported"], max_age
 
     async def observe_status(self):
-        """Async generator that yields state_reported dicts as the device pushes updates."""
+        """Async generator that yields state_reported dicts as the device pushes updates.
+
+        The device answers the registration only with its next notification,
+        sent when its status changes, which can take hours on a quiet device,
+        so the first status is awaited without a timeout; use ping() to tell a
+        quiet device from a gone one. A new registration replaces the previous
+        one from the same address.
+        """
 
         def decrypt_status(response):
             payload_encrypted = response.payload.decode()
@@ -178,22 +253,24 @@ class Client:
         request.opt.observe = 0
         requester = self._ctx.request(request)
         observation = requester.observation
+        self._observation_generation += 1
+        generation = self._observation_generation
+        self._observing = True
         try:
-            response = await asyncio.wait_for(requester.response, self.REPLY_TIMEOUT)
-            yield self._observed(decrypt_status(response))
-            if observation is not None:
-                async for response in observation:
-                    try:
-                        status = decrypt_status(response)
-                    except (DigestMismatchException, ValueError) as err:
-                        logger.warning("dropping unreadable status notification: %r", err)
-                        continue
-                    yield self._observed(status)
+            responses = _chain(await requester.response, observation)
+            async for response in responses:
+                try:
+                    status = decrypt_status(response)
+                except (DigestMismatchException, ValueError) as err:
+                    logger.warning("dropping unreadable status notification: %r", err)
+                    continue
+                yield self._observed(status)
         finally:
-            self._observed_status = None
-            for confirmed in self._confirmations:
-                if not confirmed.done():
-                    confirmed.set_result(False)
+            if generation == self._observation_generation:
+                self._observing = False
+                for confirmed in self._confirmations:
+                    if not confirmed.done():
+                        confirmed.set_result(False)
             # Cancel the observation when the caller stops iterating, so the
             # device stops sending notifications and aiocoap frees its resources.
             if observation is not None:
@@ -229,17 +306,22 @@ class Client:
         an observe_status() running on this client receives; the command is
         resent once if none arrives, and fails if that observation ends first.
         A notification confirms the command only if it reports every key of
-        it that the device reported before. Confirmation is skipped, and
-        acceptance alone counts, when no observation runs, when the device
-        does not report the command's keys, or when it already reports the
-        values: the device sends nothing when nothing changes. Values compare
-        with ==, so they must be sent in the type the device reports. Commands
-        run one at a time, so a resend never undoes a newer command.
+        it that the device reported before, or every key when nothing was
+        notified yet. Confirmation is skipped, and acceptance alone counts,
+        when no observation runs, when the device does not report the
+        command's keys, or when it already reports the values: the device
+        sends nothing when nothing changes. For that reason a command sent
+        before the first notification, for values the device already has,
+        fails. Values compare with ==, so they must be sent in the type the
+        device reports. Commands run one at a time, so a resend never undoes
+        a newer command.
         """
         async with self._control_lock:
-            status = self._observed_status
-            if not confirm or status is None:
+            if not confirm or not self._observing:
                 return await self._send_control(data, retry_count, resync)
+            status = self._observed_status
+            if status is None:
+                return await self._send_confirmed(data, dict(data), retry_count, resync)
             expected = {k: data[k] for k in data if k in status}
             if not expected or _reports(status, expected):
                 return await self._send_control(data, retry_count, resync)
@@ -250,7 +332,7 @@ class Client:
     ) -> bool:
         """Send data until a notification reports the expected values."""
         for attempt in range(1, self.CONFIRM_ATTEMPTS + 1):
-            if self._observed_status is None:
+            if not self._observing:
                 logger.warning("%s stopped notifying before confirming %s", self.host, data)
                 return False
             # Registered before sending, as the notification can beat the reply.
@@ -345,3 +427,11 @@ class Client:
 def _reports(status: dict, expected: dict) -> bool:
     """Whether status carries every key of expected, with its value."""
     return all(k in status and status[k] == v for k, v in expected.items())
+
+
+async def _chain(first, rest):
+    """Yield first, then everything rest yields, if there is a rest."""
+    yield first
+    if rest is not None:
+        async for item in rest:
+            yield item
