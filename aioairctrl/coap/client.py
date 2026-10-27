@@ -1,5 +1,6 @@
 """CoAP client for Philips air purifiers."""
 
+import asyncio
 import json
 import logging
 import os
@@ -24,6 +25,15 @@ class Client:
     CONTROL_PATH = "/sys/dev/control"
     SYNC_PATH = "/sys/dev/sync"
 
+    # Every request is NON (no CoAP retransmission), so a lost request or reply
+    # never arrives late: waiting longer than a round trip only delays the retry.
+    REPLY_TIMEOUT: float = 5
+    SYNC_ATTEMPTS = 3
+    # How long a confirmed command waits for the status notification that
+    # reports it, and how often it is sent before giving up.
+    CONFIRM_TIMEOUT: float = 5
+    CONFIRM_ATTEMPTS = 2
+
     def __init__(self, host, port=5683):
         self.host = host
         self.port = port
@@ -31,6 +41,10 @@ class Client:
         # call even if _init never completed.
         self._client_context: Context | None = None
         self._encryption_context: EncryptionContext | None = None
+        # The latest status an active observe_status() received, and the
+        # confirmed commands waiting for a notification that reports them.
+        self._observed_status: dict | None = None
+        self._confirmations: dict[asyncio.Future, dict] = {}
 
     @property
     def _ctx(self) -> Context:
@@ -66,24 +80,36 @@ class Client:
         if self._client_context:
             await self._client_context.shutdown()
 
+    async def _request(self, request: Message) -> Message:
+        """Send request and return its reply, raising TimeoutError if none arrives."""
+        return await asyncio.wait_for(self._ctx.request(request).response, self.REPLY_TIMEOUT)
+
     async def _sync(self):
         """Exchange a nonce with the device to obtain the initial client key.
 
         The client sends a random 4-byte hex string; the device responds with
         the client key that must be used for all subsequent encrypted messages.
+        A device in Wi-Fi power save can miss the request, so it is retried
+        before raising TimeoutError.
         """
-        logger.debug("syncing")
-        sync_request = os.urandom(4).hex().upper()
-        request = Message(
-            code=POST,
-            mtype=NON,
-            uri=f"coap://{self.host}:{self.port}{self.SYNC_PATH}",
-            payload=sync_request.encode(),
-        )
-        response = await self._ctx.request(request).response
-        client_key = response.payload.decode()
-        logger.debug("synced: %s", client_key)
-        self._enc.set_client_key(client_key)
+        for attempt in range(1, self.SYNC_ATTEMPTS + 1):
+            logger.debug("syncing (attempt %d/%d)", attempt, self.SYNC_ATTEMPTS)
+            sync_request = os.urandom(4).hex().upper()
+            request = Message(
+                code=POST,
+                mtype=NON,
+                uri=f"coap://{self.host}:{self.port}{self.SYNC_PATH}",
+                payload=sync_request.encode(),
+            )
+            try:
+                response = await self._request(request)
+            except TimeoutError:
+                continue
+            client_key = response.payload.decode()
+            logger.debug("synced: %s", client_key)
+            self._enc.set_client_key(client_key)
+            return
+        raise TimeoutError(f"{self.host} did not answer {self.SYNC_ATTEMPTS} sync requests")
 
     async def get_status(self):
         """Return (state_reported, max_age) for the current device status."""
@@ -96,7 +122,7 @@ class Client:
         # observe=0 registers a CoAP observation; the first response carries
         # the current state, which is all we consume here.
         request.opt.observe = 0
-        response = await self._ctx.request(request).response
+        response = await self._request(request)
         payload_encrypted = response.payload.decode()
         payload = self._enc.decrypt(payload_encrypted)
         logger.debug("status: %s", payload)
@@ -128,7 +154,7 @@ class Client:
         observation = requester.observation
         try:
             response = await requester.response
-            yield decrypt_status(response)
+            yield self._observed(decrypt_status(response))
             if observation is not None:
                 async for response in observation:
                     try:
@@ -136,24 +162,76 @@ class Client:
                     except (DigestMismatchException, ValueError) as err:
                         logger.warning("dropping unreadable status notification: %r", err)
                         continue
-                    yield status
+                    yield self._observed(status)
         finally:
+            self._observed_status = None
             # Cancel the observation when the caller stops iterating, so the
             # device stops sending notifications and aiocoap frees its resources.
             if observation is not None:
                 observation.cancel()
 
-    async def set_control_value(self, key, value, retry_count=5, resync=True) -> bool:
+    def _observed(self, status: dict) -> dict:
+        """Record a notified status and resolve the confirmations it reports."""
+        self._observed_status = status
+        for confirmed, data in self._confirmations.items():
+            if not confirmed.done() and _reports(status, data):
+                confirmed.set_result(None)
+        return status
+
+    async def set_control_value(
+        self, key, value, retry_count=5, resync=True, confirm=False
+    ) -> bool:
         return await self.set_control_values(
-            data={key: value}, retry_count=retry_count, resync=resync
+            data={key: value}, retry_count=retry_count, resync=resync, confirm=confirm
         )
 
-    async def set_control_values(self, data: dict, retry_count=5, resync=True) -> bool:
-        """Send a control command to the device, retrying on failure.
+    async def set_control_values(
+        self, data: dict, retry_count=5, resync=True, confirm=False
+    ) -> bool:
+        """Send a control command to the device, returning whether it took effect.
 
-        On the first failure, if resync=True, the client re-syncs the
-        encryption key before retrying. Subsequent failures retry without
-        re-syncing (stale key is unlikely to be the cause after one resync).
+        Without confirm, success means the device accepted the command. Some
+        devices accept a command and then ignore it, so with confirm and an
+        active observe_status() on this client, success also needs a status
+        notification reporting the new values; the command is resent once if
+        none arrives. A command the device already reports, or one whose keys
+        the device never reports, is not waited on: the device sends no
+        notification when nothing changes.
+        """
+        for attempt in range(1, self.CONFIRM_ATTEMPTS + 1):
+            status = self._observed_status
+            if not confirm or status is None or not any(k in status for k in data):
+                return await self._send_control(data, retry_count, resync)
+            if _reports(status, data):
+                return await self._send_control(data, retry_count, resync)
+            # Registered before sending, as the notification can beat the reply.
+            confirmed = asyncio.get_running_loop().create_future()
+            self._confirmations[confirmed] = data
+            try:
+                if not await self._send_control(data, retry_count, resync):
+                    return False
+                await asyncio.wait_for(confirmed, self.CONFIRM_TIMEOUT)
+                return True
+            except TimeoutError:
+                logger.warning(
+                    "%s accepted %s but reported no change within %ss (attempt %d/%d)",
+                    self.host,
+                    data,
+                    self.CONFIRM_TIMEOUT,
+                    attempt,
+                    self.CONFIRM_ATTEMPTS,
+                )
+            finally:
+                del self._confirmations[confirmed]
+        return False
+
+    async def _send_control(self, data: dict, retry_count: int, resync: bool) -> bool:
+        """Send a control command until the device accepts it, retrying on failure.
+
+        A failed or missing reply is retried. On the first failure, if
+        resync=True, the client re-syncs the encryption key before retrying.
+        Subsequent failures retry without re-syncing (stale key is unlikely to
+        be the cause after one resync).
         """
         state_desired = {
             "state": {
@@ -175,14 +253,21 @@ class Client:
                 uri=f"coap://{self.host}:{self.port}{self.CONTROL_PATH}",
                 payload=payload_encrypted.encode(),
             )
-            response = await self._ctx.request(request).response
-            logger.debug("RESPONSE: %s", response.payload)
-            result = json.loads(response.payload)
-            if result.get("status") == "success":
-                return True
+            try:
+                response = await self._request(request)
+            except TimeoutError:
+                logger.debug("set_control_value got no reply")
+            else:
+                logger.debug("RESPONSE: %s", response.payload)
+                result = json.loads(response.payload)
+                if result.get("status") == "success":
+                    return True
             if attempt == 0 and resync:
                 logger.debug("set_control_value failed, resyncing...")
-                await self._sync()
+                try:
+                    await self._sync()
+                except TimeoutError:
+                    logger.debug("resync got no reply")
             else:
                 logger.debug(
                     "set_control_value failed, retrying (attempt %d/%d)...",
@@ -191,3 +276,8 @@ class Client:
                 )
         logger.error("set_control_value failed: %s", data)
         return False
+
+
+def _reports(status: dict, data: dict) -> bool:
+    """Whether status reports every key of data that it carries, with data's value."""
+    return all(status[k] == v for k, v in data.items() if k in status)

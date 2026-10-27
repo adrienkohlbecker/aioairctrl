@@ -1,0 +1,242 @@
+"""Client behaviour against a fake device: lost replies, ignored commands, stale notifications."""
+
+import asyncio
+import json
+
+import pytest
+
+from aioairctrl.coap.client import Client
+from aioairctrl.coap.encryption import EncryptionContext
+
+
+class FakeDevice:
+    """Answer sync and control requests and push status notifications.
+
+    `replies` scripts each control reply ("success", "failed" or None for a
+    lost reply); `applies` scripts whether each accepted command changes the
+    device; `lost_syncs` counts sync requests to drop.
+    """
+
+    def __init__(self, status, replies=(), applies=(), lost_syncs=0):
+        self.status = dict(status)
+        self.replies = list(replies)
+        self.applies = list(applies)
+        self.lost_syncs = lost_syncs
+        self.controls = []
+        self.syncs = 0
+        self.notifications: asyncio.Queue | None = None
+        self._enc = EncryptionContext()
+        self._enc.set_client_key("00000001")
+
+    def notify(self):
+        payload = json.dumps({"state": {"reported": self.status}})
+        assert self.notifications is not None
+        self.notifications.put_nowait(FakeMessage(self._enc.encrypt(payload).encode()))
+
+    def request(self, message):
+        loop = asyncio.get_running_loop()
+        requester = FakeRequester(loop.create_future())
+        path = message.opt.uri_path
+        if path == ("sys", "dev", "sync"):
+            self.syncs += 1
+            if self.lost_syncs:
+                self.lost_syncs -= 1
+            else:
+                requester.response.set_result(FakeMessage(b"0000ABCD"))
+        elif path == ("sys", "dev", "status"):
+            self.notifications = asyncio.Queue()
+            requester.observation = FakeObservation(self.notifications)
+            self.notify()
+            requester.response.set_result(self.notifications.get_nowait())
+        elif path == ("sys", "dev", "control"):
+            desired = json.loads(EncryptionContext().decrypt(message.payload.decode()))
+            data = {
+                k: v
+                for k, v in desired["state"]["desired"].items()
+                if k not in ("CommandType", "DeviceId", "EnduserId")
+            }
+            self.controls.append(data)
+            reply = self.replies.pop(0) if self.replies else "success"
+            if reply is not None:
+                requester.response.set_result(FakeMessage(json.dumps({"status": reply}).encode()))
+            if reply == "success" and (self.applies.pop(0) if self.applies else True):
+                changed = any(self.status.get(k) != v for k, v in data.items())
+                self.status.update(data)
+                if changed and self.notifications is not None:
+                    self.notify()
+        return requester
+
+
+class FakeMessage:
+    def __init__(self, payload):
+        self.payload = payload
+        self.opt = type("Options", (), {"max_age": None})()
+
+
+class FakeRequester:
+    def __init__(self, response):
+        self.response = response
+        self.observation: FakeObservation | None = None
+
+
+class FakeObservation:
+    def __init__(self, queue):
+        self._queue = queue
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        return await self._queue.get()
+
+    def cancel(self):
+        pass
+
+
+def make_client(device):
+    client = Client("192.0.2.1")
+    client.REPLY_TIMEOUT = 0.01
+    client.CONFIRM_TIMEOUT = 0.05
+    client._client_context = device  # type: ignore[assignment]
+    client._encryption_context = EncryptionContext()
+    client._enc.set_client_key("00000001")
+    return client
+
+
+async def observed(client, device):
+    """Start observing and return the task once the first status is in."""
+    seen = asyncio.Event()
+
+    async def observe():
+        async for _status in client.observe_status():
+            seen.set()
+
+    task = asyncio.create_task(observe())
+    await asyncio.wait_for(seen.wait(), 1)
+    return task
+
+
+def run(coroutine):
+    return asyncio.run(asyncio.wait_for(coroutine, 5))
+
+
+def test_sync_retries_a_lost_reply():
+    device = FakeDevice({}, lost_syncs=2)
+    client = make_client(device)
+    run(client._sync())
+    assert device.syncs == 3
+
+
+def test_sync_raises_after_every_attempt_is_lost():
+    device = FakeDevice({}, lost_syncs=3)
+    client = make_client(device)
+    with pytest.raises(TimeoutError):
+        run(client._sync())
+    assert device.syncs == 3
+
+
+def test_control_retries_a_lost_reply():
+    device = FakeDevice({"pwr": 0}, replies=[None, "success"])
+    client = make_client(device)
+    assert run(client.set_control_values({"pwr": 1})) is True
+    assert device.controls == [{"pwr": 1}, {"pwr": 1}]
+
+
+def test_control_fails_when_every_reply_is_lost():
+    device = FakeDevice({"pwr": 0}, replies=[None] * 3)
+    client = make_client(device)
+    assert run(client.set_control_values({"pwr": 1}, retry_count=2)) is False
+    assert len(device.controls) == 3
+
+
+def test_unconfirmed_control_trusts_the_reply():
+    device = FakeDevice({"mode": 17}, applies=[False])
+    client = make_client(device)
+    assert run(client.set_control_values({"mode": 0})) is True
+    assert device.status["mode"] == 17
+
+
+async def _confirmed(device, data):
+    client = make_client(device)
+    task = await observed(client, device)
+    try:
+        return await client.set_control_values(data, confirm=True)
+    finally:
+        task.cancel()
+
+
+def test_confirmed_control_returns_once_reported():
+    device = FakeDevice({"pwr": 1, "mode": 17})
+    assert run(_confirmed(device, {"mode": 0})) is True
+    assert device.controls == [{"mode": 0}]
+
+
+def test_confirmed_control_resends_an_ignored_command():
+    device = FakeDevice({"pwr": 1, "mode": 17}, applies=[False, True])
+    assert run(_confirmed(device, {"mode": 0})) is True
+    assert device.controls == [{"mode": 0}, {"mode": 0}]
+    assert device.status["mode"] == 0
+
+
+def test_confirmed_control_fails_when_never_applied():
+    device = FakeDevice({"pwr": 1, "mode": 17}, applies=[False, False])
+    assert run(_confirmed(device, {"mode": 0})) is False
+    assert device.controls == [{"mode": 0}, {"mode": 0}]
+
+
+def test_confirmed_control_ignores_a_stale_notification():
+    # The device pushes its old status first, then applies the command.
+    async def scenario():
+        device = FakeDevice({"pwr": 1, "mode": 17}, applies=[False])
+        client = make_client(device)
+        task = await observed(client, device)
+
+        async def apply_late():
+            await asyncio.sleep(0.01)
+            device.notify()  # stale: still mode 17
+            await asyncio.sleep(0.01)
+            device.status["mode"] = 0
+            device.notify()
+
+        late = asyncio.create_task(apply_late())
+        try:
+            return await client.set_control_values({"mode": 0}, confirm=True), device
+        finally:
+            await late
+            task.cancel()
+
+    result, device = run(scenario())
+    assert result is True
+    assert device.controls == [{"mode": 0}]
+
+
+def test_confirmed_control_does_not_wait_for_an_unchanged_value():
+    # The device sends no notification when nothing changes.
+    device = FakeDevice({"pwr": 1, "mode": 0})
+    assert run(_confirmed(device, {"mode": 0})) is True
+    assert device.controls == [{"mode": 0}]
+
+
+def test_confirmed_control_does_not_wait_for_unreported_keys():
+    device = FakeDevice({"pwr": 1}, applies=[False])
+    assert run(_confirmed(device, {"unreported": 1})) is True
+    assert device.controls == [{"unreported": 1}]
+
+
+def test_confirm_without_observation_trusts_the_reply():
+    device = FakeDevice({"pwr": 1, "mode": 17}, applies=[False])
+    client = make_client(device)
+    assert run(client.set_control_values({"mode": 0}, confirm=True)) is True
+    assert device.controls == [{"mode": 0}]
+
+
+def test_observation_end_stops_confirming():
+    async def scenario():
+        device = FakeDevice({"pwr": 1, "mode": 17}, applies=[False])
+        client = make_client(device)
+        task = await observed(client, device)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return await client.set_control_values({"mode": 0}, confirm=True)
+
+    assert run(scenario()) is True
