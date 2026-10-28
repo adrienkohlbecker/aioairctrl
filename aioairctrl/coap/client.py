@@ -57,6 +57,8 @@ class Client:
         # so the replaced one's cleanup leaves the new state alone.
         self._observing = False
         self._observation_generation = 0
+        # Registrations the device has not answered yet; see shutdown().
+        self._unanswered: set[asyncio.Future] = set()
         # One command at a time: a resent command must not undo a newer one.
         self._control_lock = asyncio.Lock()
 
@@ -154,6 +156,16 @@ class Client:
         # context before shutting it down.
         context, self._client_context = self._client_context, None
         if context:
+            # aiocoap drops a request whose response future was cancelled one
+            # loop iteration later, and fails any request still pending at
+            # shutdown with set_exception(), which raises on a cancelled
+            # future. An observation cancelled just before shutdown, as an
+            # unload does, would hit that, so cancel the unanswered
+            # registrations here and let aiocoap drop them first.
+            if self._unanswered:
+                for response in self._unanswered:
+                    response.cancel()
+                await asyncio.sleep(0)
             await context.shutdown()
 
     async def _request(self, request: Message) -> Message:
@@ -253,6 +265,8 @@ class Client:
         request.opt.observe = 0
         requester = self._ctx.request(request)
         observation = requester.observation
+        self._unanswered.add(requester.response)
+        requester.response.add_done_callback(self._unanswered.discard)
         self._observation_generation += 1
         generation = self._observation_generation
         self._observing = True

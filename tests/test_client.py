@@ -1,10 +1,13 @@
 """Client behaviour against a fake device: lost replies, ignored commands, stale notifications."""
 
 import asyncio
+import gc
 import json
+import socket
 import time
 
 import pytest
+from aiocoap import Context
 from aiocoap.error import NetworkError
 
 from aioairctrl.coap.client import Client
@@ -627,6 +630,32 @@ def test_shutdown_twice_shuts_the_context_down_once():
     run(client.shutdown())
     run(client.shutdown())
     assert context.shutdowns == 1
+
+
+def test_shutdown_right_after_cancelling_an_unanswered_observation():
+    """As a reload does: the observation task is cancelled, then the client shut down at once."""
+
+    async def scenario():
+        errors = []
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda _loop, context: errors.append(context))
+        quiet = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        quiet.bind(("127.0.0.1", 0))
+        try:
+            client = Client("127.0.0.1", quiet.getsockname()[1])
+            client._client_context = await Context.create_client_context(transports=["simple6"])
+            client._encryption_context = EncryptionContext()
+            task, _ = await quiet_observation(client)
+            await asyncio.sleep(0.05)
+            task.cancel()
+            await client.shutdown()
+            await asyncio.sleep(0.01)
+            gc.collect()
+            return errors
+        finally:
+            quiet.close()
+
+    assert run(scenario()) == []
 
 
 def test_a_partial_notification_before_the_command_does_not_skip_confirmation():
